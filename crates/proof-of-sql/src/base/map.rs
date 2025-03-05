@@ -1,10 +1,12 @@
-pub(crate) type IndexMap<K, V> =
-    indexmap::IndexMap<K, V, core::hash::BuildHasherDefault<ahash::AHasher>>;
-pub(crate) type IndexSet<T> = indexmap::IndexSet<T, core::hash::BuildHasherDefault<ahash::AHasher>>;
+/// `IndexMap` with ahash hasher.
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, core::hash::BuildHasherDefault<ahash::AHasher>>;
+/// `IndexSet` with ahash hasher.
+pub type IndexSet<T> = indexmap::IndexSet<T, core::hash::BuildHasherDefault<ahash::AHasher>>;
 
 // Adapted from `indexmap`.
 
 /// Create an [`IndexMap`][self::IndexMap] from a list of key-value pairs
+#[macro_export]
 macro_rules! indexmap_macro {
     ($($key:expr => $value:expr,)+) => { $crate::base::map::indexmap!($($key => $value),+) };
     ($($key:expr => $value:expr),*) => {
@@ -23,6 +25,7 @@ macro_rules! indexmap_macro {
 }
 
 /// Create an [`IndexSet`][self::IndexSet] from a list of values
+#[macro_export]
 macro_rules! indexset_macro {
     ($($value:expr,)+) => { $crate::base::map::indexset!($($value),+) };
     ($($value:expr),*) => {
@@ -38,5 +41,5 @@ macro_rules! indexset_macro {
     };
 }
 
-pub(crate) use indexmap_macro as indexmap;
-pub(crate) use indexset_macro as indexset;
+pub use indexmap_macro as indexmap;
+pub use indexset_macro as indexset;
