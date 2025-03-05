@@ -64,8 +64,8 @@ mod equals_expr_test;
 mod table_expr;
 pub(crate) use table_expr::TableExpr;
 
-#[cfg(test)]
-pub(crate) mod test_utility;
+/// Test utility functions for `ProofExpr`
+pub mod test_utility;
 
 mod column_expr;
 pub(crate) use column_expr::ColumnExpr;
