@@ -1,8 +1,11 @@
-use super::{expr_to_proof_expr, table_reference_to_table_ref, PlannerError, PlannerResult};
+use super::{
+    df_schema_to_column_fields, expr_to_proof_expr, table_reference_to_table_ref, PlannerError,
+    PlannerResult,
+};
 use alloc::vec::Vec;
 use datafusion::{
     common::DFSchema,
-    logical_expr::{Expr, LogicalPlan, TableScan},
+    logical_expr::{Expr, Limit, LogicalPlan, Projection, TableScan, Union},
     sql::{sqlparser::ast::Ident, TableReference},
 };
 use indexmap::IndexMap;
@@ -156,6 +159,78 @@ pub fn logical_plan_to_proof_plan(
             projected_schema,
             filters,
         ),
+        // No filter but fetch limit
+        LogicalPlan::TableScan(TableScan {
+            table_name,
+            projection,
+            projected_schema,
+            filters,
+            fetch: Some(fetch),
+            ..
+        }) if filters.is_empty() => {
+            let input_plan = table_scan_to_projection(
+                table_name,
+                schemas,
+                projection.clone(),
+                projected_schema,
+            )?;
+            Ok(DynProofPlan::new_slice(input_plan, 0, Some(*fetch)))
+        }
+        // Filter and fetch limit
+        LogicalPlan::TableScan(TableScan {
+            table_name,
+            projection,
+            projected_schema,
+            filters,
+            fetch: Some(fetch),
+            ..
+        }) if !filters.is_empty() => {
+            let input_plan = table_scan_to_filter(
+                table_name,
+                schemas,
+                projection.clone(),
+                projected_schema,
+                filters,
+            )?;
+            Ok(DynProofPlan::new_slice(input_plan, 0, Some(*fetch)))
+        }
+        // Projection
+        LogicalPlan::Projection(Projection {
+            input,
+            expr,
+            schema,
+            ..
+        }) => {
+            let input_plan = logical_plan_to_proof_plan(input, schemas)?;
+            let input_schema = input.schema();
+            let aliased_exprs = expr
+                .iter()
+                .zip(schema.fields().into_iter())
+                .map(|(e, field)| -> PlannerResult<AliasedDynProofExpr> {
+                    let proof_expr = expr_to_proof_expr(e, input_schema)?;
+                    let alias = field.name().as_str().into();
+                    Ok(AliasedDynProofExpr {
+                        expr: proof_expr,
+                        alias,
+                    })
+                })
+                .collect::<PlannerResult<Vec<_>>>()?;
+            Ok(DynProofPlan::new_projection(aliased_exprs, input_plan))
+        }
+        // Limit
+        LogicalPlan::Limit(Limit { input, fetch, skip }) => {
+            let input_plan = logical_plan_to_proof_plan(input, schemas)?;
+            Ok(DynProofPlan::new_slice(input_plan, *skip, *fetch))
+        }
+        // Union
+        LogicalPlan::Union(Union { inputs, schema }) => {
+            let input_plans = inputs
+                .iter()
+                .map(|input| logical_plan_to_proof_plan(input, schemas))
+                .collect::<PlannerResult<Vec<_>>>()?;
+            let column_fields = df_schema_to_column_fields(schema)?;
+            Ok(DynProofPlan::new_union(input_plans, column_fields))
+        }
         _ => Err(PlannerError::UnsupportedLogicalPlan { plan: plan.clone() }),
     }
 }
