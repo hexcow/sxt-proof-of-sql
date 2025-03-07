@@ -353,7 +353,7 @@ impl DivideAndModuloExpr {
         (quotient_wrapped, remainder)
     }
 
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn prover_evaluate<'a, S: Scalar>(
         &self,
         builder: &mut FinalRoundBuilder<'a, S>,
@@ -435,17 +435,11 @@ impl DivideAndModuloExpr {
             3,
         )?;
 
-        // sign(sqrt(-min) + s) = 1
-        // sign(sqrt(-min) - s) = 1
+        // get sign(sqrt(-min) + s)
+        // get sign(sqrt(-min) - s)
         let min_sqrt_eval = S::from(self.data_type().0.sqrt_negative_min().unwrap()) * one_eval;
         let sqrt_min_plus_s = verifier_evaluate_sign(builder, min_sqrt_eval + s, one_eval, None)?;
         let sqrt_min_less_s = verifier_evaluate_sign(builder, min_sqrt_eval - s, one_eval, None)?;
-
-        if sqrt_min_plus_s != S::ZERO || sqrt_min_less_s != S::ZERO {
-            return Err(ProofError::VerificationError {
-                error: "Intermediate value out of range",
-            });
-        }
 
         // MIN < q < -MIN
         // We need at least an extra bit to allow for -MIN
@@ -481,6 +475,14 @@ impl DivideAndModuloExpr {
             2,
         )?;
 
+        // sign(sqrt(-min) + s) = 1
+        // sign(sqrt(-min) - s) = 1
+        if sqrt_min_plus_s != S::ZERO || sqrt_min_less_s != S::ZERO {
+            return Err(ProofError::VerificationError {
+                error: "Intermediate value out of range",
+            });
+        }
+
         Ok((quotient, remainder))
     }
 
@@ -501,6 +503,7 @@ mod tests {
             database::{Column, ColumnRef, ColumnType, Table, TableRef},
             map::indexmap,
             polynomial::MultilinearExtension,
+            proof::ProofError,
             scalar::{test_scalar::TestScalar, Scalar},
         },
         sql::{
@@ -764,14 +767,50 @@ mod tests {
 
     #[test]
     fn we_can_verify_simple_expr() {
-        check_constraints(
-            None,
-            None,
-            None,
-            &[i128::MAX, i128::MIN, 2],
-            &[3i128, 3, -4],
-            &[],
+        let alloc = Bump::new();
+        let table_ref: TableRef = "sxt.t".parse().unwrap();
+        let lhs_ident = Ident::from("lhs");
+        let rhs_ident = Ident::from("rhs");
+        let lhs_ref = ColumnRef::new(table_ref.clone(), lhs_ident.clone(), ColumnType::Int128);
+        let rhs_ref = ColumnRef::new(table_ref, rhs_ident.clone(), ColumnType::Int128);
+        let divide_and_modulo_expr = DivideAndModuloExpr::new(
+            Box::new(DynProofExpr::Column(ColumnExpr::new(lhs_ref.clone()))),
+            Box::new(DynProofExpr::Column(ColumnExpr::new(rhs_ref.clone()))),
         );
+        let lhs = &[i128::MAX, i128::MIN, 2];
+        let rhs = &[3i128, 3, -4];
+        let mut final_round_builder = FinalRoundBuilder::new(lhs.len(), VecDeque::new());
+        let table = Table::try_new(indexmap! {
+            lhs_ident => Column::Int128::<TestScalar>(lhs),
+            rhs_ident => Column::Int128::<TestScalar>(rhs),
+        })
+        .unwrap();
+        divide_and_modulo_expr.prover_evaluate(&mut final_round_builder, &alloc, &table);
+        let mock_verification_builder = run_verify_for_each_row(
+            lhs.len(),
+            &final_round_builder,
+            4,
+            |verification_builder, chi_eval, evaluation_point| {
+                let accessor = indexmap! {
+                    lhs_ref.clone() => lhs.inner_product(evaluation_point),
+                    rhs_ref.clone() => rhs.inner_product(evaluation_point)
+                };
+                divide_and_modulo_expr
+                    .verifier_evaluate(verification_builder, &accessor, chi_eval)
+                    .unwrap();
+            },
+        );
+        let matrix = mock_verification_builder.get_identity_results();
+        let reduced_matrix = matrix.iter().map(|v| {
+            assert!(v[6..(v.len() - 2)].iter().all(|b| *b));
+            let mut vec = v[0..6].to_vec();
+            vec.extend(v[(v.len() - 2)..v.len()].iter());
+            vec
+        });
+        for row in reduced_matrix {
+            let failing_constraints = get_failing_constraints(&row);
+            assert_eq!(failing_constraints, []);
+        }
     }
 
     /// Shifting remainder by a very small amount will only fail the division algorithm
@@ -892,5 +931,82 @@ mod tests {
             &[3i128, 7, -3, -3],
             &[TestableConstraints::RemainderSignMatchesNumerator],
         );
+    }
+
+    #[test]
+    fn we_can_reject_if_quotient_and_rhs_are_too_high() {
+        let alloc = Bump::new();
+        let quotient = vec![TestScalar::from(1i128 << 126)];
+        let rhs_i128 = (1i128 << 126) + 1;
+        let overflow: i128 = (TestScalar::from(1i128 << 126) * TestScalar::from(rhs_i128))
+            .try_into()
+            .unwrap();
+        let lhs = &[rhs_i128];
+        let rhs = &[rhs_i128];
+        let mut mock_functionality = MockMockableDivideAndModuloExprFunctionality::new();
+        mock_functionality
+            .expect_divide_columns()
+            .return_const((quotient.clone(), quotient.clone()));
+        mock_functionality
+            .expect_modulo_columns()
+            .return_const(vec![rhs_i128 - overflow]);
+        mock_functionality
+            .expect_get_in_range_column_from_quotient_and_rhs()
+            .return_const(quotient);
+        let mock_utilities = MockDivideAndModuloExprUtilities {
+            functions: mock_functionality,
+        };
+        let table_ref: TableRef = "sxt.t".parse().unwrap();
+        let lhs_ident = Ident::from("lhs");
+        let rhs_ident = Ident::from("rhs");
+        let lhs_ref = ColumnRef::new(table_ref.clone(), lhs_ident.clone(), ColumnType::Int128);
+        let rhs_ref = ColumnRef::new(table_ref, rhs_ident.clone(), ColumnType::Int128);
+        let divide_and_modulo_expr = DivideAndModuloExpr::new(
+            Box::new(DynProofExpr::Column(ColumnExpr::new(lhs_ref.clone()))),
+            Box::new(DynProofExpr::Column(ColumnExpr::new(rhs_ref.clone()))),
+        );
+        let mut final_round_builder = FinalRoundBuilder::new(lhs.len(), VecDeque::new());
+        let table = Table::try_new(indexmap! {
+            lhs_ident => Column::Int128::<TestScalar>(lhs),
+            rhs_ident => Column::Int128::<TestScalar>(rhs),
+        })
+        .unwrap();
+        divide_and_modulo_expr.prover_evaluate_base(
+            &mut final_round_builder,
+            &alloc,
+            &table,
+            &mock_utilities,
+        );
+        let mock_verification_builder = run_verify_for_each_row(
+            1,
+            &final_round_builder,
+            4,
+            |verification_builder, chi_eval, evaluation_point| {
+                let accessor = indexmap! {
+                    lhs_ref.clone() => lhs.inner_product(evaluation_point),
+                    rhs_ref.clone() => rhs.inner_product(evaluation_point)
+                };
+                let err = divide_and_modulo_expr
+                    .verifier_evaluate(verification_builder, &accessor, chi_eval)
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    ProofError::VerificationError {
+                        error: "Intermediate value out of range"
+                    }
+                ));
+            },
+        );
+        let matrix = mock_verification_builder.get_identity_results();
+        let reduced_matrix = matrix.iter().map(|v| {
+            assert!(v[6..(v.len() - 2)].iter().all(|b| *b));
+            let mut vec = v[0..6].to_vec();
+            vec.extend(v[(v.len() - 2)..v.len()].iter());
+            vec
+        });
+        for row in reduced_matrix {
+            let failing_constraints = get_failing_constraints(&row);
+            assert_eq!(failing_constraints, []);
+        }
     }
 }
